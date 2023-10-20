@@ -22,6 +22,8 @@ namespace SRanipalExtTrackingInterface
         // Kernel32 SetDllDirectory
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         private static extern bool SetDllDirectory(string lpPathName);
+        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr LoadLibrary(string lpFileName);
 
         public override (bool SupportsEye, bool SupportsExpression) Supported => (true, true);
 
@@ -57,7 +59,12 @@ namespace SRanipalExtTrackingInterface
             
             Logger.LogInformation($"SRanipalExtTrackingModule: SRanipal version: {srRuntimeVer}");
             
-            SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
+            //SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
+            string d = Path.Combine(Directory.GetParent(Utils.CustomLibsDirectory)!.FullName, "ModuleLibs");
+            SetDllDirectory(d);
+            if (!Directory.Exists(d))
+                Directory.CreateDirectory(d);
+            SaveModulesToDirAndLoad(d);
 
             Error eyeError = Error.UNDEFINED, lipError = Error.UNDEFINED;
 
@@ -423,6 +430,42 @@ namespace SRanipalExtTrackingInterface
 
                 #endregion
             }
+        }
+
+        private void SaveStreamToFile(Stream? s, string o)
+        {
+            if (s == null) return;
+            FileStream fs = new FileStream(o, FileMode.OpenOrCreate, FileAccess.ReadWrite,
+                FileShare.ReadWrite | FileShare.Delete);
+            using MemoryStream ms = new MemoryStream();
+            s.CopyTo(ms);
+            fs.Write(new ReadOnlySpan<byte>(ms.ToArray()));
+            fs.Dispose();
+        }
+
+        private void SaveModulesToDirAndLoad(string dir)
+        {
+            System.Reflection.Assembly a = System.Reflection.Assembly.GetExecutingAssembly();
+            var libHTC_License = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.libHTC_License.dll");
+            var nanomsg = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.nanomsg.dll");
+            var SRanipal = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.SRanipal.dll");
+            var SRWorks_Log = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.SRWorks_Log.dll");
+            var ViveSR_Client = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.ViveSR_Client.dll");
+            string[] libPaths = 
+            {
+                Path.Combine(dir, "libHTC_License.dll"),
+                Path.Combine(dir, "nanomsg.dll"),
+                Path.Combine(dir, "SRanipal.dll"),
+                Path.Combine(dir, "SRWorks_Log.dll"),
+                Path.Combine(dir, "ViveSR_Client.dll")
+            };
+            SaveStreamToFile(libHTC_License, libPaths[0]);
+            SaveStreamToFile(nanomsg, libPaths[1]);
+            SaveStreamToFile(SRanipal, libPaths[2]);
+            SaveStreamToFile(SRWorks_Log, libPaths[3]);
+            SaveStreamToFile(ViveSR_Client, libPaths[4]);
+            foreach (string libPath in libPaths)
+                LoadLibrary(libPath);
         }
     }
 }
