@@ -11,6 +11,7 @@ using VRCFaceTracking.Core.Library;
 using VRCFaceTracking.Core.Params.Data;
 using VRCFaceTracking.Core.Params.Expressions;
 using VRCFaceTracking.Core.Types;
+using Utils = VRCFaceTracking.Core.Utils;
 
 namespace SRanipalExtTrackingInterface
 {
@@ -18,12 +19,41 @@ namespace SRanipalExtTrackingInterface
     {
         LipData_v2 lipData = default;
         EyeData_v2 eyeData = default;
-        private static bool eyeEnabled = false, lipEnabled = false, isViveProEye = false;
+        private static bool eyeEnabled = false, 
+                            lipEnabled = false, 
+                            isViveProEye = false,
+                            isWireless = false;
+        private static Error eyeError = Error.UNDEFINED;
+        private static Error lipError = Error.UNDEFINED;
+
+        internal static Process? _process;
+        internal static IntPtr _processHandle;
+        internal static IntPtr _offset;
+        
+        private static byte[] eyeImageCache, lipImageCache;
+        
         // Kernel32 SetDllDirectory
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
         private static extern bool SetDllDirectory(string lpPathName);
-        [DllImport("kernel32", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern IntPtr LoadLibrary(string lpFileName);
+        
+        private static bool Attach()
+        {
+            var processes = Process.GetProcessesByName("sr_runtime");
+            if (processes.Length <= 0) return false;
+            _process = processes[0];
+            _processHandle =
+                Utils.OpenProcess(Utils.PROCESS_VM_READ, false, _process.Id);
+            return true;
+        }
+
+        private static byte[] ReadMemory(IntPtr offset, ref byte[] buf) {
+            var bytesRead = 0;
+            var size = buf.Length;
+            
+            Utils.ReadProcessMemory((int) _processHandle, offset, buf, size, ref bytesRead);
+
+            return bytesRead != size ? null : buf;
+        }
 
         public override (bool SupportsEye, bool SupportsExpression) Supported => (true, true);
 
@@ -38,6 +68,41 @@ namespace SRanipalExtTrackingInterface
             
             // Get the directory of the sr_runtime.exe program from our start menu shortcut. This is where the SRanipal dlls are located.
             var srInstallDir = (string) Registry.LocalMachine.OpenSubKey(@"Software\VIVE\SRWorks\SRanipal")?.GetValue("ModuleFileName");
+
+            // I appreciate auto-clearing giant logs, but this broke sr-runtime.exe in some instances :sob:
+            /*var localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+            // Logs can be stored in SRAnipal_logs on some versions
+            var srLogsDirectory =
+                Directory.Exists(Path.Combine(localAppData + @"Low\HTC Corporation\SR_Logs\SRAnipal_Logs"))
+                    ? Path.Combine(localAppData + @"Low\HTC Corporation\SR_Logs\SRAnipal_Logs")
+                    : Path.Combine(localAppData + @"Low\HTC Corporation\SR_logs\");
+
+            try
+            {
+                // Get logs that should be yeeted.
+                string[] srLogFiles = Directory.GetFiles(srLogsDirectory);
+
+                foreach (string logFile in srLogFiles)
+                {
+                    try
+                    {
+                        using (var stream = File.Open(logFile, FileMode.Open, FileAccess.Write, FileShare.ReadWrite))
+                        {
+                            Logger.LogDebug($"Clearing \"{logFile}\"");
+                            stream.SetLength(0);
+                            stream.Close();
+                        }
+                    }
+                    catch
+                    {
+                        Logger.LogWarning($"Failed to delete log file \"{logFile}\"");
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                Logger.LogError("Failed to clear SRanipal Logs Directory! " + e);
+            }*/
 
             if (srInstallDir == null)
             {
@@ -59,22 +124,12 @@ namespace SRanipalExtTrackingInterface
             
             Logger.LogInformation($"SRanipalExtTrackingModule: SRanipal version: {srRuntimeVer}");
             
-            //SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
-            string d = Path.Combine(Directory.GetParent(Utils.CustomLibsDirectory)!.FullName, "ModuleLibs");
-            SetDllDirectory(d);
-            if (!Directory.Exists(d))
-                Directory.CreateDirectory(d);
-            SaveModulesToDirAndLoad(d);
+            SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
 
-            Error eyeError = Error.UNDEFINED, lipError = Error.UNDEFINED;
+            SRanipal_API.InitialRuntime(); // hack to unblock sranipal!!!
 
-            if (eyeAvailable)
-                eyeError = SRanipal_API.Initial(SRanipal_Eye_v2.ANIPAL_TYPE_EYE_V2, IntPtr.Zero);
-
-            if (expressionAvailable)
-                lipError = SRanipal_API.Initial(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, IntPtr.Zero);
-
-            HandleSrErrors(eyeError, lipError);
+            eyeEnabled = InitTracker(SRanipal_Eye_v2.ANIPAL_TYPE_EYE_V2, "Eye");
+            lipEnabled = InitTracker(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, "Lip");
 
             if (eyeEnabled && Utils.HasAdmin)
             {
@@ -95,7 +150,7 @@ namespace SRanipalExtTrackingInterface
                         {
                             _offset = module.BaseAddress; 
                             
-                            switch (_process.MainModule.FileVersionInfo.FileVersion)
+                            switch (_process.MainModule?.FileVersionInfo.FileVersion)
                             {
                                 case "1.3.2.0":
                                     _offset += 0x19190;
@@ -109,11 +164,11 @@ namespace SRanipalExtTrackingInterface
                                     UnifiedTracking.EyeImageData.SupportsImage = false;
                                     break;
                             }
-
-                            //(_process.MainModule.FileVersionInfo.FileVersion == "1.3.2.0" ? 0x19190 : 0x19100);
                         }
                             
                     UnifiedTracking.EyeImageData.ImageSize = (200, 100);
+                    UnifiedTracking.EyeImageData.ImageData = new byte[200 * 100 * 4];
+                    eyeImageCache = new byte[200 * 100];
                 }
             }
             
@@ -121,10 +176,11 @@ namespace SRanipalExtTrackingInterface
             {
                 UnifiedTracking.LipImageData.SupportsImage = true;
                 UnifiedTracking.LipImageData.ImageSize = (SRanipal_Lip_v2.ImageWidth, SRanipal_Lip_v2.ImageHeight);
-                UnifiedTracking.LipImageData.ImageData = new byte[UnifiedTracking.LipImageData.ImageSize.x *
-                                                                       UnifiedTracking.LipImageData.ImageSize.y];
                 lipData.image = Marshal.AllocCoTaskMem(UnifiedTracking.LipImageData.ImageSize.x *
                                                        UnifiedTracking.LipImageData.ImageSize.x);
+
+                UnifiedTracking.LipImageData.ImageData = new byte[SRanipal_Lip_v2.ImageWidth * SRanipal_Lip_v2.ImageHeight * 4];
+                lipImageCache = new byte[SRanipal_Lip_v2.ImageWidth * SRanipal_Lip_v2.ImageHeight];
             }
 
             ModuleInformation = new ModuleMetadata()
@@ -140,92 +196,70 @@ namespace SRanipalExtTrackingInterface
 
             isViveProEye = SRanipal_Eye_API.IsViveProEye();
 
-            return (eyeEnabled, lipEnabled);
+            return (eyeAvailable && eyeEnabled, expressionAvailable && lipEnabled);
         }
 
-        private static void HandleSrErrors(Error eyeError, Error lipError)
+        private bool InitTracker(int anipalType, string name)
         {
-            if (eyeError == Error.WORK)
-                eyeEnabled = true;
+            Logger.LogInformation($"Initializing {name}...");
+            var error = SRanipal_API.Initial(anipalType, IntPtr.Zero);
 
-            if (lipError == Error.FOXIP_SO)
-                while (lipError == Error.FOXIP_SO)
-                    lipError = SRanipal_API.Initial(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, IntPtr.Zero);
-            
-            if (lipError == Error.WORK)
-                lipEnabled = true;
+            handler:
+            switch (error)
+            {
+                case Error.FOXIP_SO: // wireless issue
+                    Logger.LogInformation("Vive wireless detected. Forcing initialization...");
+                    while (error == Error.FOXIP_SO)
+                        error = SRanipal_API.Initial(anipalType, IntPtr.Zero);
+                    goto handler;
+                case Error.WORK:
+                    Logger.LogInformation($"{name} successfully started!");
+                    return true;
+                default:
+                    break;
+            }
+            Logger.LogInformation($"{name} failed to initialize: {error}");
+            return false;
         }
         
         public override void Teardown()
         {
-            // We won't bother terminating sranipal modules here as if this is a shutdown, they'll automatically be released.
+            SRanipal_API.ReleaseRuntime();
         }
 
-        #region Update
-
-        
         public override void Update()
         {
             Thread.Sleep(10);
 
             if (Status != ModuleState.Active)
                 return;
-            
-            if (lipEnabled && UpdateMouth() != Error.WORK)
+            if (lipEnabled && !UpdateMouth())
             {
-                Logger.LogError("An error occured while getting lip data. This might be a wireless crash.");
-                Logger.LogWarning("Waiting 30 seconds before reinitializing to account for wireless users.");
-                Thread.Sleep(30000);
-               // UnifiedLibManager.Initialize();
-                return;
+                Logger.LogError("An error has occured when updating tracking. Reinitializing needed runtimes.");
+                SRanipal_API.InitialRuntime();
+                InitTracker(SRanipal_Lip_v2.ANIPAL_TYPE_LIP_V2, "Lip");
             }
-
-            if (eyeEnabled && UpdateEye() != Error.WORK)
+            if (eyeEnabled && !UpdateEye())
             {
-                Logger.LogError("An error occured while getting eye data. This might be a wireless crash.");
-                Logger.LogWarning("Waiting 30 seconds before reinitializing to account for wireless users.");
-                Thread.Sleep(30000);
-                //UnifiedLibManager.Initialize();
-                return;
+                Logger.LogError("An error has occured when updating tracking. Reinitializing needed runtimes.");
+                SRanipal_API.InitialRuntime();
+                InitTracker(SRanipal_Eye_v2.ANIPAL_TYPE_EYE_V2, "Eye");
             }
         }
 
-        #endregion
-
-        private static Process _process;
-        private static IntPtr _processHandle;
-        private IntPtr _offset;
-
-        private static bool Attach()
+        private bool UpdateEye()
         {
-            if (Process.GetProcessesByName("sr_runtime").Length <= 0) return false;
-            _process = Process.GetProcessesByName("sr_runtime")[0];
-            _processHandle =
-                Utils.OpenProcess(Utils.PROCESS_VM_READ,
-                    false, _process.Id);
-            return true;
-        }
-
-        private static byte[] ReadMemory(IntPtr offset, int size) {
-            var buffer = new byte[size];
-
-            var bytesRead = 0;
-            Utils.ReadProcessMemory((int) _processHandle, offset, buffer, size, ref bytesRead);
-
-            return bytesRead != size ? null : buffer;
-        }
-        
-        private Error UpdateEye()
-        {
-            var updateResult = SRanipal_Eye_API.GetEyeData_v2(ref eyeData);
+            eyeError = SRanipal_Eye_API.GetEyeData_v2(ref eyeData);
+            if (eyeError != Error.WORK) return false;
 
             UpdateEyeParameters(ref UnifiedTracking.Data.Eye, eyeData.verbose_data);
             UpdateEyeExpressions(ref UnifiedTracking.Data.Shapes, eyeData.expression_data);
 
-            if (_processHandle == IntPtr.Zero || !UnifiedTracking.EyeImageData.SupportsImage) return updateResult;
+            if (_processHandle == IntPtr.Zero || !UnifiedTracking.EyeImageData.SupportsImage) 
+                return true;
             
             // Read 20000 image bytes from the predefined offset. 10000 bytes per eye.
-            var imageBytes = ReadMemory(_offset, 20000);
+            var imageBytes = ReadMemory(_offset, ref eyeImageCache);
             
             // Concatenate the two images side by side instead of one after the other
             byte[] leftEye = new byte[10000];
@@ -242,11 +276,23 @@ namespace SRanipalExtTrackingInterface
                 // Add 100 bytes from the right eye to the right side of the image
                 Array.Copy(rightEye, i*100, imageBytes, leftIndex + 100, 100);
             }
+            
+            for (int y = 0; y < 100; y++)
+            {
+                for (int x = 0; x < 200; x++)
+                {
+                    byte grayscaleValue = imageBytes[y * 200 + x];
 
-            // Write the image to the latest eye data
-            UnifiedTracking.EyeImageData.ImageData = imageBytes;
+                    // Set the R, G, B, and A channels to the grayscale value
+                    int index = (y * 200 + x) * 4;
+                    UnifiedTracking.EyeImageData.ImageData[index + 0] = grayscaleValue; // R
+                    UnifiedTracking.EyeImageData.ImageData[index + 1] = grayscaleValue; // G
+                    UnifiedTracking.EyeImageData.ImageData[index + 2] = grayscaleValue; // B
+                    UnifiedTracking.EyeImageData.ImageData[index + 3] = 255; // A (fully opaque)
+                }
+            }
 
-            return updateResult;
+            return true;
         }
 
         private static Vector3 GetConvergenceAngleOffset(VerboseData external)
@@ -323,18 +369,35 @@ namespace SRanipalExtTrackingInterface
             data[(int)UnifiedExpressions.BrowLowererRight].Weight = external.right.eye_squeeze;
         }
 
-        private Error UpdateMouth()
+        private bool UpdateMouth()
         {
-            var updateResult = SRanipal_Lip_API.GetLipData_v2(ref lipData);
-
+            lipError = SRanipal_Lip_API.GetLipData_v2(ref lipData);
+            if (lipError != Error.WORK)
+                return false;
             UpdateMouthExpressions(ref UnifiedTracking.Data, lipData.prediction_data);
 
-            if (lipData.image == IntPtr.Zero || !UnifiedTracking.LipImageData.SupportsImage) return updateResult;
+            if (lipData.image == IntPtr.Zero || !UnifiedTracking.LipImageData.SupportsImage) 
+                return true;
 
-            Marshal.Copy(lipData.image, UnifiedTracking.LipImageData.ImageData, 0, UnifiedTracking.LipImageData.ImageSize.x *
+            Marshal.Copy(lipData.image, lipImageCache, 0, UnifiedTracking.LipImageData.ImageSize.x *
             UnifiedTracking.LipImageData.ImageSize.y);
+            
+            for (int y = 0; y < 400; y++)
+            {
+                for (int x = 0; x < 800; x++)
+                {
+                    byte grayscaleValue = lipImageCache[y * 800 + x];
 
-            return updateResult;
+                    // Set the R, G, B, and A channels to the grayscale value
+                    int index = (y * 800 + x) * 4;
+                    UnifiedTracking.LipImageData.ImageData[index + 0] = grayscaleValue; // R
+                    UnifiedTracking.LipImageData.ImageData[index + 1] = grayscaleValue; // G
+                    UnifiedTracking.LipImageData.ImageData[index + 2] = grayscaleValue; // B
+                    UnifiedTracking.LipImageData.ImageData[index + 3] = 255; // A (fully opaque)
+                }
+            }
+
+            return true;
         }
 
         private void UpdateMouthExpressions(ref UnifiedTrackingData data, PredictionData_v2 external)
@@ -430,42 +493,6 @@ namespace SRanipalExtTrackingInterface
 
                 #endregion
             }
-        }
-
-        private void SaveStreamToFile(Stream? s, string o)
-        {
-            if (s == null) return;
-            FileStream fs = new FileStream(o, FileMode.OpenOrCreate, FileAccess.ReadWrite,
-                FileShare.ReadWrite | FileShare.Delete);
-            using MemoryStream ms = new MemoryStream();
-            s.CopyTo(ms);
-            fs.Write(new ReadOnlySpan<byte>(ms.ToArray()));
-            fs.Dispose();
-        }
-
-        private void SaveModulesToDirAndLoad(string dir)
-        {
-            System.Reflection.Assembly a = System.Reflection.Assembly.GetExecutingAssembly();
-            var libHTC_License = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.libHTC_License.dll");
-            var nanomsg = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.nanomsg.dll");
-            var SRanipal = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.SRanipal.dll");
-            var SRWorks_Log = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.SRWorks_Log.dll");
-            var ViveSR_Client = a.GetManifestResourceStream("SRanipalExtTrackingModule.ModuleLibs.ViveSR_Client.dll");
-            string[] libPaths = 
-            {
-                Path.Combine(dir, "libHTC_License.dll"),
-                Path.Combine(dir, "nanomsg.dll"),
-                Path.Combine(dir, "SRanipal.dll"),
-                Path.Combine(dir, "SRWorks_Log.dll"),
-                Path.Combine(dir, "ViveSR_Client.dll")
-            };
-            SaveStreamToFile(libHTC_License, libPaths[0]);
-            SaveStreamToFile(nanomsg, libPaths[1]);
-            SaveStreamToFile(SRanipal, libPaths[2]);
-            SaveStreamToFile(SRWorks_Log, libPaths[3]);
-            SaveStreamToFile(ViveSR_Client, libPaths[4]);
-            foreach (string libPath in libPaths)
-                LoadLibrary(libPath);
         }
     }
 }
