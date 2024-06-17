@@ -1,5 +1,6 @@
 ﻿using Microsoft.Extensions.Logging;
 using System.Diagnostics;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using Microsoft.Win32;
 using ViveSR;
@@ -64,7 +65,7 @@ namespace SRanipalExtTrackingInterface
             var lipStream = a.GetManifestResourceStream("SRanipalExtTrackingModule.Assets.vive_face_tracker.png");
 
             // Look for SRanipal assemblies here. Placeholder for unmanaged assemblies not being embedded in the dll.
-            var currentDllDirectory = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
+            //var currentDllDirectory = System.IO.Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location);
             
             // Get the directory of the sr_runtime.exe program from our start menu shortcut. This is where the SRanipal dlls are located.
             var srInstallDir = (string) Registry.LocalMachine.OpenSubKey(@"Software\VIVE\SRWorks\SRanipal")?.GetValue("ModuleFileName");
@@ -124,7 +125,8 @@ namespace SRanipalExtTrackingInterface
             
             Logger.LogInformation($"SRanipalExtTrackingModule: SRanipal version: {srRuntimeVer}");
             
-            SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
+            //SetDllDirectory(currentDllDirectory + "\\ModuleLibs\\" + (srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old"));
+            SetDllDirectory(WriteAndLoadAssemblies(a, Utils.PersistentDataDirectory, srRuntimeVer));
 
             SRanipal_API.InitialRuntime(); // hack to unblock sranipal!!!
 
@@ -220,6 +222,33 @@ namespace SRanipalExtTrackingInterface
             }
             Logger.LogInformation($"{name} failed to initialize: {error}");
             return false;
+        }
+
+        // We have the ModuleLibs, but they're never saved anywhere. The directory is just kinda, assumed?
+        private string WriteAndLoadAssemblies(Assembly assembly, string persistentData, string srRuntimeVer)
+        {
+            string dir = Path.Combine(persistentData, "ModuleLibs", srRuntimeVer.StartsWith("1.3.6") ? "New" : "Old");
+            if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
+            foreach (string manifestResourceName in assembly.GetManifestResourceNames())
+            {
+                if(!manifestResourceName.EndsWith(".dll")) continue;
+                string[] dllNameSplit = manifestResourceName.Split('.');
+                // Yes, I know this won't work if the name contains multiple dots. I don't care.
+                string dllName = dllNameSplit[dllNameSplit.Length - 2] + ".dll";
+                string newOutput = Path.Combine(dir, dllName);
+                if(File.Exists(newOutput)) continue;
+                using Stream? nativeDll = assembly.GetManifestResourceStream(manifestResourceName);
+                if (nativeDll == null)
+                {
+                    Logger.LogWarning($"Could not get stream from Manifest {manifestResourceName}");
+                    continue;
+                }
+                using FileStream fs = new FileStream(newOutput, FileMode.Create, FileAccess.ReadWrite,
+                    FileShare.ReadWrite | FileShare.Delete);
+                nativeDll.CopyTo(fs);
+                fs.Close();
+            }
+            return dir;
         }
         
         public override void Teardown()
